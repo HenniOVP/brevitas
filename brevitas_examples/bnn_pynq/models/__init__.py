@@ -26,7 +26,7 @@ from configparser import ConfigParser
 import torch
 from torch import hub
 
-__all__ = ['cnv_1w1a', 'cnv_1w2a', 'cnv_2w2a',
+__all__ = ['cnv_1w1a', 'cnv_1w2a', 'cnv_2w2a', 'cnv_8w8a',
            'sfc_1w1a', 'sfc_1w2a', 'sfc_2w2a',
            'tfc_1w1a', 'tfc_1w2a', 'tfc_2w2a',
            'lfc_1w1a', 'lfc_1w2a']
@@ -74,6 +74,10 @@ def cnv_1w2a(pretrained=True):
 
 def cnv_2w2a(pretrained=True):
     model, _ = model_with_cfg('cnv_2w2a', pretrained)
+    return model
+
+def cnv_8w8a(pretrained=True):
+    model, _ = model_with_cfg('cnv_8w8a', pretrained)
     return model
 
 
