@@ -86,6 +86,9 @@ class Logger(object):
     def info(self, arg):
         self.log.info(arg)
 
+    def warning(self, arg):
+        self.log.warning(arg)
+
     def eval_batch_cli_log(self, epoch_meters, batch, tot_batches):
         self.info('Test: [{0}/{1}]\t'
                   'Model Time {model_time.val:.3f} ({model_time.avg:.3f})\t'
