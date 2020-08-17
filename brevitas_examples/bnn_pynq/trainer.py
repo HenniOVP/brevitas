@@ -108,6 +108,7 @@ class Trainer(object):
             msg = "Loaded model num_classes miss match, call arguments requested {}, but saved is {}"
             msg = msg.format(self.num_classes, cfg.getint('MODEL', 'NUM_CLASSES'))
             assert self.num_classes == cfg.getint('MODEL', 'NUM_CLASSES'), msg
+            self.logger.info("Loaded {} from original examples".format(args.network))
         except AssertionError as e:
             # Create requested model ourselves
             msg = "Could not load default model, creating new one as requested. The following assertion failed: {}"
@@ -128,6 +129,7 @@ class Trainer(object):
                           act_bit_width = args.act_bit_width,
                           in_bit_width = in_bit_width,
                           )
+            self.logger.info("Created fresh model for {}".format(args.network))
 
         # Randomness
         random.seed(args.random_seed)
