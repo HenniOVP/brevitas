@@ -31,10 +31,10 @@ from torch import nn
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.datasets import MNIST, CIFAR10
+from torchvision.datasets import MNIST, CIFAR10, CIFAR100
 
 from .logger import Logger, TrainingEpochMeters, EvalEpochMeters
-from .models import model_with_cfg
+from .models import model_with_cfg, model_impl_no_wrapper
 from .models.losses import SqrHingeLoss
 
 
@@ -57,12 +57,9 @@ def accuracy(output, target, topk=(1,)):
 class Trainer(object):
     def __init__(self, args):
 
-        model, cfg = model_with_cfg(args.network, args.pretrained)
-
         # Init arguments
         self.args = args
-        prec_name = "_{}W{}A".format(cfg.getint('QUANT', 'WEIGHT_BIT_WIDTH'), cfg.getint('QUANT', 'ACT_BIT_WIDTH'))
-        experiment_name = '{}{}_{}'.format(args.network, prec_name, datetime.now().strftime('%Y%m%d_%H%M%S'))
+        experiment_name = '{}_{}_{}'.format(args.dataset, args.network, datetime.now().strftime('%Y%m%d_%H%M%S'))
         self.output_dir_path = os.path.join(args.experiments, experiment_name)
 
         if self.args.resume:
@@ -76,28 +73,68 @@ class Trainer(object):
                 os.mkdir(self.checkpoints_dir_path)
         self.logger = Logger(self.output_dir_path, args.dry_run)
 
-        # Randomness
-        random.seed(args.random_seed)
-        torch.manual_seed(args.random_seed)
-        torch.cuda.manual_seed_all(args.random_seed)
-
-        # Datasets
+        # Start with getting the requested dataset
         transform_to_tensor = transforms.Compose([transforms.ToTensor()])
-
-        dataset = cfg.get('MODEL', 'DATASET')
-        self.num_classes = cfg.getint('MODEL', 'NUM_CLASSES')
+        dataset = args.dataset
         if dataset == 'CIFAR10':
             train_transforms_list = [transforms.RandomCrop(32, padding=4),
                                      transforms.RandomHorizontalFlip(),
                                      transforms.ToTensor()]
             transform_train = transforms.Compose(train_transforms_list)
             builder = CIFAR10
+            self.num_classes = 10
+        elif dataset == 'CIFAR100':
+            train_transforms_list = [transforms.RandomCrop(32, padding=4),
+                                     transforms.RandomHorizontalFlip(),
+                                     transforms.ToTensor()]
+            transform_train = transforms.Compose(train_transforms_list)
+            builder = CIFAR100
+            self.num_classes = 100
 
         elif dataset == 'MNIST':
             transform_train = transform_to_tensor
             builder = MNIST
+            self.num_classes = 10
         else:
             raise Exception("Dataset not supported: {}".format(args.dataset))
+
+        # Try to extract the correct model from save data
+        try:
+            model, cfg = model_with_cfg(args.network, args.pretrained)
+            # Check that requested dataset matches and num classes
+            msg = "Loaded model miss match, call arguments requested {}, but saved is {}"
+            msg = msg.format(dataset, cfg.get('MODEL', 'DATASET'))
+            assert dataset == cfg.get('MODEL', 'DATASET'), msg
+            msg = "Loaded model num_classes miss match, call arguments requested {}, but saved is {}"
+            msg = msg.format(self.num_classes, cfg.getint('MODEL', 'NUM_CLASSES'))
+            assert self.num_classes == cfg.getint('MODEL', 'NUM_CLASSES'), msg
+        except AssertionError as e:
+            # Create requested model ourselves
+            msg = "Could not load default model, creating new one as requested. The following assertion failed: {}"
+            msg = msg.format(e)
+            self.logger.warning(msg)
+            # Extract architecture info, example string: LFC_1W1A
+            arch = args.network.split("_")[0].upper()
+            if arch not in model_impl_no_wrapper:
+                raise Exception("Model not supported: {}".format(arch))
+            # Instaciate network
+            if arch == "CNV":
+                in_bit_width = 8
+            else:
+                in_bit_width = 1
+            model = model_impl_no_wrapper[arch]
+            model = model(num_classes = self.num_classes,
+                          weight_bit_width = args.weight_bit_width,
+                          act_bit_width = args.act_bit_width,
+                          in_bit_width = in_bit_width,
+                          )
+
+        # Randomness
+        random.seed(args.random_seed)
+        torch.manual_seed(args.random_seed)
+        torch.cuda.manual_seed_all(args.random_seed)
+
+        # Datasets building
 
         train_set = builder(root=args.datadir,
                             train=True,

@@ -81,6 +81,10 @@ def parse_args(args):
     # Neural network Architecture
     parser.add_argument("--network", default="LFC_1W1A", type=str, help="neural network")
     parser.add_argument("--pretrained", action='store_true', help="Load pretrained model")
+    parser.add_argument("--dataset", default="CIFAR10", type=str, help="Training dataset")
+    parser.add_argument("--weight_bit_width", default="1", type=none_or_int, help="Weight bit width")
+    parser.add_argument("--act_bit_width", default="1", type=none_or_int, help="Activation bit width")
+
     return parser.parse_args(args)
 
 
