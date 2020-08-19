@@ -43,6 +43,8 @@ from typing import Optional, Union, Tuple
 
 from torch import nn
 from torch.nn import Module
+import torch
+from numpy import isclose
 
 from brevitas.core.bit_width import BitWidthParameter, BitWidthImplType
 from brevitas.core.function_wrapper import Identity, ConstScalarClamp
@@ -53,6 +55,7 @@ from brevitas.core.scaling import ScalingImplType, StatsInputViewShapeImpl
 from brevitas.proxy.runtime_quant import ActivationQuantProxy
 from .quant_layer import QuantLayer, SCALING_MIN_VAL
 
+import brevitas.onnx.onnx_custom_ops as finn_onnx_ops
 
 class QuantActivation(QuantLayer, Module):
     __metaclass__ = ABCMeta
@@ -114,6 +117,9 @@ class QuantReLU(QuantActivation):
                  override_pretrained_bit_width: bool = False,
                  return_quant_tensor: bool = False):
         super(QuantReLU, self).__init__(return_quant_tensor=return_quant_tensor)
+        # save a copy of args passed constructor, used to determine whether
+        # the quantization config is exportable to something FINN supports
+        self.init_args = locals()
         activation_impl = nn.ReLU()
         self.act_quant_proxy = ActivationQuantProxy(activation_impl=activation_impl,
                                                     bit_width=bit_width,
@@ -139,7 +145,119 @@ class QuantReLU(QuantActivation):
                                                     scaling_stats_permute_dims=scaling_stats_permute_dims,
                                                     scaling_stats_op=scaling_stats_op,
                                                     scaling_stats_buffer_momentum=scaling_stats_buffer_momentum)
+    
+    def get_exportable_quantization_type(self):
+        # Brevitas provides a wide range of possibilities for quantization,
+        # but FINN only supports a subset. Here we test the quantization
+        # config to see if it's something that FINN would understand.
+        # TODO: the checks below are overly conservative, relax these.
+        # alternatively, create specialized subclasses and only provide export
+        # flows for those.
+        ia = self.init_args
+        if (
+            ia["bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["scaling_per_channel"] == False and
+            ia["float_to_int_impl_type"] == FloatToIntImplType.ROUND and
+            ia["scaling_stats_sigma"] == 2.0 and
+            ia["scaling_stats_op"] == StatsOp.MEAN_LEARN_SIGMA_STD and
+            ia["scaling_stats_buffer_momentum"] == 0.1 and
+            ia["scaling_stats_permute_dims"] == (1, 0, 2, 3) and
+            ia["per_channel_broadcastable_shape"] == None and
+            ia["min_overall_bit_width"] == 2 and
+            ia["max_overall_bit_width"] == None and
+            ia["bit_width_impl_override"] == None and
+            ia["restrict_bit_width_type"] == RestrictValueType.INT and
+            ia["override_pretrained_bit_width"] == False and
+            ia["return_quant_tensor"] == False
+            ):
+            if ia["bit_width"] == 1 and ia["quant_type"] == QuantType.BINARY:
+                raise Exception("export_mode: BIPOLAR activation type unsupported by ReLu")
+                #return "BIPOLAR"
+            elif ia["quant_type"] == QuantType.INT:
+                bw = ia["bit_width"]
+                if bw in [1,2,4,8,16]:
+                    return "UINT%d" % ia["bit_width"]
+                else:
+                    raise Exception("Unsupported bitwidth for export")
+        elif(
+            ia["bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["float_to_int_impl_type"] == FloatToIntImplType.ROUND and
+            ia["scaling_stats_sigma"] == 2.0 and
+            ia["scaling_stats_op"] == StatsOp.MEAN_LEARN_SIGMA_STD and
+            ia["scaling_stats_buffer_momentum"] == 0.1 and
+            ia["scaling_stats_permute_dims"] == (1, 0, 2, 3) and
+            len(ia["per_channel_broadcastable_shape"]) == 4 and
+            ia["per_channel_broadcastable_shape"][0] == 1 and
+            ia["per_channel_broadcastable_shape"][2] == 1 and
+            ia["per_channel_broadcastable_shape"][3] == 1 and
+            ia["min_overall_bit_width"] == 2 and
+            ia["max_overall_bit_width"] == None and
+            ia["bit_width_impl_override"] == None and
+            ia["restrict_bit_width_type"] == RestrictValueType.INT and
+            ia["override_pretrained_bit_width"] == False and
+            ia["return_quant_tensor"] == True
+            ):
+            if ia["bit_width"] == 1 and ia["quant_type"] == QuantType.BINARY:
+                raise Exception("export_mode: BIPOLAR activation type unsupported by ReLu")
+                #return "BIPOLAR"
+            elif ia["quant_type"] == QuantType.INT:
+                bw = ia["bit_width"]
+                if bw in [1,2,4,8,16]:
+                    return "UINT%d" % ia["bit_width"]
+                else:
+                    raise Exception("Unsupported bitwidth for export")
 
+        else:
+            raise Exception("Unsupported config combination for export")
+
+    @QuantLayer.export_mode.setter
+    def export_mode(self, value):
+        ia = self.init_args
+        self._export_mode = value
+        # create completely detached prequantized tensors for export
+        # calling these in forward() causes the ops to be included in the graph
+        # as dead-end nodes. note: this might be fixed in PyTorch 1.2.0 and
+        # if so this workaround prepare_for_export is not necessary.
+
+        self.export_act_scale = self.quant_act_scale().type(torch.FloatTensor).detach()
+        self.export_act_bias = None
+        n_distinct_values = 2 ** ia["bit_width"]
+        n_thresholds = n_distinct_values - 1
+        if ia["per_channel_broadcastable_shape"] is None:
+            channels = 1
+            step = torch.abs(self.export_act_scale) 
+            self.export_thres = torch.empty([channels, n_thresholds])
+            min_thres = step/2
+            for t in range(n_thresholds):
+                self.export_thres[0][t] = min_thres + step * t
+        else:
+            if ia["scaling_per_channel"] is True:
+                channels = ia["per_channel_broadcastable_shape"][1]
+                step = torch.abs(self.export_act_scale).flatten()
+                self.export_thres = torch.empty([channels, n_thresholds])
+                min_thres = step/2
+                for c in range(channels):
+                    for t in range(n_thresholds):
+                        self.export_thres[c][t] = min_thres[c] + step[c] * t
+            else:
+                channels = ia["per_channel_broadcastable_shape"][1]
+                step = torch.abs(self.export_act_scale).flatten()
+                self.export_thres = torch.empty([channels, n_thresholds])
+                min_thres = step/2
+                for c in range(channels):
+                    for t in range(n_thresholds):
+                        self.export_thres[c][t] = min_thres + step * t
+
+
+    def forward(self, input):
+        if self.export_mode:
+            return finn_onnx_ops.QuantReLUPlaceholderFunction.apply(
+                input, self.get_exportable_quantization_type(),
+                self.export_thres, self.export_act_bias, self.export_act_scale
+                )
+        else:
+            return super().forward(input)
+        
 
 class QuantSigmoid(QuantActivation):
 
@@ -202,6 +320,7 @@ class QuantTanh(QuantActivation):
                  override_pretrained_bit_width: bool = False,
                  return_quant_tensor: bool = False):
         super(QuantTanh, self).__init__(return_quant_tensor=return_quant_tensor)
+        
         activation_impl = nn.Tanh()
         self.act_quant_proxy = ActivationQuantProxy(activation_impl=activation_impl,
                                                     bit_width=bit_width,
@@ -256,6 +375,9 @@ class QuantHardTanh(QuantActivation):
                  override_pretrained_bit_width: bool = False,
                  return_quant_tensor: bool = False):
         super(QuantHardTanh, self).__init__(return_quant_tensor=return_quant_tensor)
+        # save a copy of args passed constructor, used to determine whether
+        # the quantization config is exportable to something FINN supports
+        self.init_args = locals()
         if quant_type == QuantType.FP:
             activation_impl = ConstScalarClamp(min_val=min_val, max_val=max_val)
         else:
@@ -284,6 +406,106 @@ class QuantHardTanh(QuantActivation):
                                                     scaling_stats_op=scaling_stats_op,
                                                     scaling_stats_buffer_momentum=scaling_stats_buffer_momentum,
                                                     scaling_stats_permute_dims=scaling_stats_permute_dims)
+
+    def get_exportable_quantization_type(self):
+        # Brevitas provides a wide range of possibilities for quantization,
+        # but FINN only supports a subset. Here we test the quantization
+        # config to see if it's something that FINN would understand.
+        # TODO: the checks below are overly conservative, relax these.
+        # alternatively, create specialized subclasses and only provide export
+        # flows for those.
+        ia = self.init_args
+        if (
+            ia["bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["scaling_per_channel"] == False and
+            ia["float_to_int_impl_type"] == FloatToIntImplType.ROUND and
+            ia["scaling_stats_sigma"] == 3.0 and
+            ia["scaling_stats_op"] == StatsOp.MEAN_LEARN_SIGMA_STD and
+            ia["scaling_stats_buffer_momentum"] == 0.1 and
+            ia["scaling_stats_permute_dims"] == (1, 0, 2, 3) and
+            ia["per_channel_broadcastable_shape"] == None and
+            ia["min_overall_bit_width"] == 2 and
+            ia["max_overall_bit_width"] == None and
+            ia["bit_width_impl_override"] == None and
+            ia["restrict_bit_width_type"] == RestrictValueType.INT and
+            ia["override_pretrained_bit_width"] == False and
+            ia["return_quant_tensor"] == False
+            ):
+            if ia["bit_width"] == 1 and ia["quant_type"] == QuantType.BINARY:
+                if ia["scaling_impl_type"] != ScalingImplType.CONST:
+                    print("WARNING: BIPOLAR activation with " + 
+                        "scaling_impl_type != ScalingImplType.CONST." +
+                        " Exported BIPOLAR activations only support [-1,+1] as outputs."+
+                        " Scale parameter must be 1")
+                return "BIPOLAR"
+            elif ia["quant_type"] == QuantType.INT:
+                # note: even though this particular config is intx (signed)
+                # quantization, we set the export mode for MultiThreshold as
+                # UINTX, since the signed bias is added as a separate node
+                bw = ia["bit_width"]
+                if bw in [1,2,4,8,16]:
+                    return "UINT%d" % ia["bit_width"]
+                else:
+                    raise Exception("Unsupported bitwidth for export")
+        else:
+            raise Exception("Unsupported config combination for export")
+
+    @QuantLayer.export_mode.setter
+    def export_mode(self, value):
+        ia = self.init_args
+        self._export_mode = value
+        # create completely detached prequantized tensors for export
+        # calling these in forward() causes the ops to be included in the graph
+        # as dead-end nodes. note: this might be fixed in PyTorch 1.2.0 and
+        # if so this workaround prepare_for_export is not necessary.
+        qt = self.get_exportable_quantization_type()
+        if qt != "BIPOLAR":
+            self.export_act_scale = self.quant_act_scale().type(torch.FloatTensor).detach()
+
+            if ia["narrow_range"]:
+                # assuming narrow range, symmetric quantization around zero
+                # when using narrow range, we represent one element less
+                n_distinct_values = 2 ** ia["bit_width"] - 1
+                min_non_scaled_val = - (2 ** (ia["bit_width"]-1) -1)
+            else:
+                n_distinct_values = 2 ** ia["bit_width"]
+                min_non_scaled_val = - 2 ** (ia["bit_width"]-1)
+
+            min_non_scaled_val = torch.tensor(min_non_scaled_val).type(torch.FloatTensor)
+            self.export_act_bias = min_non_scaled_val
+            n_thresholds = n_distinct_values - 1
+            step = torch.abs(self.export_act_scale)
+            half_step = step / 2.0
+            self.export_thres = torch.empty([1, n_thresholds])
+            # compute the value of the smallest threshold, we'll neg-bias all
+            # generated thresholds by this much
+            min_thres = -half_step - step * ((n_thresholds//2) -1)
+            if not ia["narrow_range"]:
+                min_thres -= step
+            for t in range(n_thresholds):
+                self.export_thres[0][t] = min_thres + step * t
+        else:
+            # export bipolar act. quantization as a MultiThreshold node
+            # with a single threshold at 0, followed by (x - 0.5) * scale
+
+            self.export_act_bias = torch.tensor(-0.5).type(torch.FloatTensor)
+            self.export_act_scale = self.quant_act_scale().type(torch.FloatTensor).detach() 
+            assert self.export_act_scale == 1, ("Unsupported BIPOLAR activation with scale parameter != 1" +
+                        " Exported BIPOLAR activations only support [-1,+1] as outputs")
+            self.export_act_scale *= 2 
+
+            self.export_thres = torch.empty([1, 1])
+            self.export_thres[0] = 0
+
+
+    def forward(self, input):
+        if self.export_mode:
+            return finn_onnx_ops.QuantizedHardTanhPlaceholderFunction.apply(
+                input, self.get_exportable_quantization_type(),
+                self.export_thres, self.export_act_bias, self.export_act_scale
+                )
+        else:
+            return super().forward(input)
 
 
 class QuantIdentity(QuantActivation):

@@ -52,18 +52,61 @@ class QuantLayer(object):
         self.compute_output_scale = compute_output_scale
         self.compute_output_bit_width = compute_output_bit_width
         self.return_quant_tensor = return_quant_tensor
+        self._export_mode = False
+        # these will be assigned during a normal forward pass; make sure to call
+        # .forward with an appropriately-sized input at least once before export
+        self.export_in_shape = None
+        self.export_out_shape = None
+        # these will be assinged during a normal forward pass during inference
+        self.export_in_scale = None
+        self.export_in_bit_width = None
+        self.export_out_scale = None
+        self.export_out_bit_width = None
+
+    @property
+    def export_mode(self):
+        return self._export_mode
+
+    @export_mode.setter
+    def export_mode(self, value):
+        self._export_mode = value
 
     def unpack_input(self, input):
-        if isinstance(input, QuantTensor):
-            return input
+        if self._export_mode:
+            if isinstance(input, QuantTensor):
+                raise Exception("QuantTensor I/O may not be used during export.")
+            else:
+                # return cached scale and bit width
+                # if input was never QuantTensor, those will be None
+                # if input was QuantTensor but now isn't (e.g. due to switch
+                # to export mode where all i/o is single tensors), return the
+                # cached values
+                return input, self.export_in_scale, self.export_in_bit_width
         else:
-            return input, None, None
+            if isinstance(input, QuantTensor):
+                self.export_in_shape = input.tensor.shape
+                # TODO control caching with own config variable
+                self.export_in_scale = input[1]
+                self.export_in_bit_width = input[2]
+                return input
+            else:
+                self.export_in_shape = input.shape
+                return input, None, None
 
     def pack_output(self,
                     output,
                     output_scale,
                     output_bit_width):
-        if self.return_quant_tensor:
-            return QuantTensor(tensor=output, scale=output_scale, bit_width=output_bit_width)
-        else:
+        if self._export_mode:
+            # do not ever return QuantTensor while exporting
+            # cached scale factors will be used in the next layer
             return output
+        else:
+            self.export_out_shape = output.shape
+            # TODO control caching with own config variable
+            self.export_out_scale = output_scale
+            self.export_out_bit_width = output_bit_width
+            if self.return_quant_tensor:
+                return QuantTensor(tensor=output, scale=output_scale, bit_width=output_bit_width)
+            else:
+                return output

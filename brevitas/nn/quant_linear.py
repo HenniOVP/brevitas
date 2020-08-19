@@ -57,6 +57,9 @@ from brevitas.proxy.parameter_quant import WeightQuantProxy, BiasQuantProxy, Wei
 from brevitas import docstrings
 from .quant_layer import QuantLayer, SCALING_MIN_VAL
 
+import brevitas.onnx as bo
+from brevitas.onnx.onnx_custom_ops import QuantizedLinearPlaceholderFunction
+
 __all__ = ['QuantLinear']
 
 
@@ -106,6 +109,9 @@ class QuantLinear(QuantLayer, Linear):
                         in_features=in_features,
                         out_features=out_features,
                         bias=bias)
+        # save a copy of args passed constructor, used to determine whether
+        # the quantization config is exportable to something FINN supports
+        self.init_args = locals()
         if weight_quant_type == QuantType.FP and compute_output_bit_width:
             raise Exception("Computing output bit width requires enabling quantization")
         if bias_quant_type != QuantType.FP and not (compute_output_scale and compute_output_bit_width):
@@ -118,7 +124,7 @@ class QuantLinear(QuantLayer, Linear):
             self.weight_quant = weight_quant_override
             self.weight_quant.add_tracked_tensor(self.weight)
         else:
-            weight_scaling_stats_input_concat_dim = 1
+            weight_scaling_stats_input_concat_dim = 0
             if weight_scaling_per_output_channel:
                 weight_stats_input_view_shape_impl = StatsInputViewShapeImpl.OVER_OUTPUT_CHANNELS
                 weight_scaling_shape = (self.out_features, 1)
@@ -158,6 +164,95 @@ class QuantLinear(QuantLayer, Linear):
                                          narrow_range=bias_narrow_range,
                                          bit_width=bias_bit_width)
 
+    def get_exportable_quantization_type(self):
+        # Brevitas provides a wide range of possibilities for quantization,
+        # but FINN only supports a subset. Here we test the quantization
+        # config to see if it's something that FINN would understand.
+        # TODO: the checks below are overly conservative, relax these.
+        # alternatively, create specialized subclasses and only provide export
+        # flows for those.
+        ia = self.init_args
+        if (
+            ia["weight_quant_type"] == QuantType.BINARY and
+            ia["weight_bit_width"] == 1 and
+            ia["weight_bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["weight_quant_override"] == None and
+            ia["weight_bit_width_impl_override"] == None and
+            ia["weight_bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["weight_restrict_bit_width_type"] == RestrictValueType.INT and
+            ia["weight_min_overall_bit_width"] == 2 and
+            ia["weight_max_overall_bit_width"] == None and
+            ia["weight_override_pretrained_bit_width"] == False and
+            ia["compute_output_scale"] == False and
+            ia["compute_output_bit_width"] == False and
+            ia["return_quant_tensor"] == False
+            ):
+            return "BIPOLAR"
+        elif (
+            ia["weight_quant_type"] == QuantType.INT and
+            ia["weight_bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["weight_quant_override"] == None and
+            ia["weight_bit_width_impl_override"] == None and
+            ia["weight_bit_width_impl_type"] == BitWidthImplType.CONST and
+            ia["weight_restrict_bit_width_type"] == RestrictValueType.INT and
+            ia["weight_min_overall_bit_width"] == 2 and
+            ia["weight_max_overall_bit_width"] == None and
+            ia["weight_override_pretrained_bit_width"] == False
+        ):
+            return "INT%d" % ia["weight_bit_width"]
+        else:
+            raise Exception("Unsupported config combination for export")
+
+    @QuantLayer.export_mode.setter
+    def export_mode(self, value):
+        self._export_mode = value
+        # create completely detached prequantized tensors for export
+        # calling these in forward() causes the ops to be included in the graph
+        # as dead-end nodes. note: this might be fixed in PyTorch 1.2.0 and
+        # if so this workaround prepare_for_export is not necessary.
+        self.export_int_weight = torch.t(self.int_weight.type(torch.FloatTensor)).detach()
+        self.export_quant_weight_scale = torch.t(self.quant_weight_scale.type(torch.FloatTensor)).detach()
+        self.export_input_node_scale = None
+
+        self.export_output_node_scale = self.export_quant_weight_scale
+        if self.compute_output_scale:
+            self.export_input_node_scale = self.export_in_scale.type(torch.FloatTensor).detach().view(-1)[0]
+            self.export_output_node_scale = self.export_out_scale.type(torch.FloatTensor).detach().view(-1)
+            if len(self.export_output_node_scale) == 1:
+                self.export_output_node_scale = self.export_output_node_scale[0]
+
+
+
+        if self.bias is not None:
+            if self.export_out_scale is not None:
+                quant_bias, _, bias_bit_width = self.bias_quant(self.bias, 
+                            self.export_out_scale, self.export_out_bit_width)
+   
+                self.export_bias = torch.t(quant_bias.type(torch.FloatTensor)).detach()
+                self.export_bias /= self.export_output_node_scale
+                self.export_bias = torch.round(self.export_bias)
+            else:
+                self.export_bias = torch.t(self.bias.type(torch.FloatTensor)).detach()
+                # divide by scale as add is before mult
+                self.export_bias /= self.export_output_node_scale
+
+        else:
+            self.export_bias = None
+
+
+        # export input quant type if available
+        ibw = self.export_in_bit_width
+        if ibw is not None:
+            ibw = int(ibw.item())
+            if ibw in [2,4,8,16,32]:
+                self.export_in_quant_type = "INT%d" % ibw
+            else:
+                raise Exception("Unsupported input bitwidth for export")
+        else:
+            self.export_in_quant_type = ibw
+
+
+
     @property
     def int_weight(self):
         if isinstance(self.weight_quant.tensor_quant, IdentityQuant):
@@ -180,32 +275,41 @@ class QuantLinear(QuantLayer, Linear):
         return scale
 
     def forward(self, input):
-        output_scale = None
-        output_bit_width = None
-        bias_bit_width = None
-
-        input, input_scale, input_bit_width = self.unpack_input(input)
-
-        quant_weight, quant_weight_scale, quant_weight_bit_width = self.weight_quant(self.weight)
-        quant_weight = self.weight_reg(quant_weight)
-
-        if self.compute_output_bit_width:
-            assert input_bit_width is not None
-            output_bit_width = self.max_output_bit_width(input_bit_width, quant_weight_bit_width)
-        if self.compute_output_scale:
-            assert input_scale is not None
-            output_scale = input_scale * quant_weight_scale
-
-        if self.bias is not None:
-            quant_bias, _, bias_bit_width = self.bias_quant(self.bias, output_scale, output_bit_width)
-            output = linear(input, quant_weight, quant_bias)
+        if self.export_mode:
+            export_qnt_type = self.get_exportable_quantization_type()
+            ret = QuantizedLinearPlaceholderFunction.apply(
+                input, self.export_int_weight, self.export_output_node_scale,
+                export_qnt_type, self.out_features, self.export_bias,
+                self.export_input_node_scale, self.export_in_quant_type
+                )
+            return ret
         else:
-            output = linear(input, quant_weight, None)
+            output_scale = None
+            output_bit_width = None
+            bias_bit_width = None
 
-        if self.compute_output_bit_width and bias_bit_width is not None:
-            output_bit_width = torch.where(bias_bit_width > output_bit_width, bias_bit_width, output_bit_width)
-            output_bit_width = output_bit_width + 1
-        return self.pack_output(output, output_scale, output_bit_width)
+            input, input_scale, input_bit_width = self.unpack_input(input)
+
+            quant_weight, quant_weight_scale, quant_weight_bit_width = self.weight_quant(self.weight)
+            quant_weight = self.weight_reg(quant_weight)
+
+            if self.compute_output_bit_width:
+                assert input_bit_width is not None
+                output_bit_width = self.max_output_bit_width(input_bit_width, quant_weight_bit_width)
+            if self.compute_output_scale:
+                assert input_scale is not None
+                output_scale = input_scale * quant_weight_scale
+
+            if self.bias is not None:
+                quant_bias, _, bias_bit_width = self.bias_quant(self.bias, output_scale, output_bit_width)
+                output = linear(input, quant_weight, quant_bias)
+            else:
+                output = linear(input, quant_weight, None)
+
+            if self.compute_output_bit_width and bias_bit_width is not None:
+                output_bit_width = torch.where(bias_bit_width > output_bit_width, bias_bit_width, output_bit_width)
+                output_bit_width = output_bit_width + 1
+            return self.pack_output(output, output_scale, output_bit_width)
 
     def max_output_bit_width(self, input_bit_width, weight_bit_width):
         max_input_val = max_uint(bit_width=input_bit_width, narrow_range=False)
@@ -213,6 +317,3 @@ class QuantLinear(QuantLayer, Linear):
         max_output_val = max_input_val * max_fc_val * self.in_features
         output_bit_width = ceil_ste(torch.log2(max_output_val))
         return output_bit_width
-
-
-
