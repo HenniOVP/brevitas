@@ -256,7 +256,7 @@ class Trainer(object):
             'best_val_acc': self.best_val_acc,
         }, best_path)
 
-        quant_export(self.model, self.checkpoints_dir_path, name,
+        self.quant_export(self.model, self.checkpoints_dir_path, name,
                      input_shape=(1, self.in_channels, 32, 32))
 
     def train_model(self):
