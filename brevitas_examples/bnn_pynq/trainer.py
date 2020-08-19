@@ -37,6 +37,8 @@ from .logger import Logger, TrainingEpochMeters, EvalEpochMeters
 from .models import model_with_cfg, model_impl_no_wrapper
 from .models.losses import SqrHingeLoss
 
+import brevitas.onnx as bo
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -52,6 +54,16 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
+
+
+def quant_export(model, output_dir_path, model_name,
+                 input_shape=(1, 3, 32, 32),
+                 input_tensor=None, torch_onnx_kwargs={}):
+    bo.export_finn_onnx(module=model,
+                        input_shape=input_shape,
+                        export_path=output_dir_path + "/" + model_name + ".onnx",
+                        input_t=input_tensor,
+                        torch_onnx_kwargs=torch_onnx_kwargs)
 
 
 class Trainer(object):
@@ -129,7 +141,9 @@ class Trainer(object):
                           act_bit_width = args.act_bit_width,
                           in_bit_width = in_bit_width,
                           )
-            self.logger.info("Created fresh model for {}".format(args.network))
+            msg = "Created fresh model for {}, with num_classes: {}, weight_bit_width: {}, act_bit_width: {}, in_bit_width: {}"
+            msg = msg.format(args.network, self.num_classes, args.weight_bit_width, args.act_bit_width, in_bit_width)
+            self.logger.info(msg)
 
         # Randomness
         random.seed(args.random_seed)
@@ -233,6 +247,9 @@ class Trainer(object):
             'epoch': epoch + 1,
             'best_val_acc': self.best_val_acc,
         }, best_path)
+
+        quant_export(self.model, self.checkpoints_dir_path, name,
+                     input_shape=(1, self.num_classes, 32, 32))
 
     def train_model(self):
 
