@@ -56,14 +56,6 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-def quant_export(model, output_dir_path, model_name,
-                 input_shape=(1, 3, 32, 32),
-                 input_tensor=None, torch_onnx_kwargs={}):
-    bo.export_finn_onnx(module=model,
-                        input_shape=input_shape,
-                        export_path=output_dir_path + "/" + model_name + ".onnx",
-                        input_t=input_tensor,
-                        torch_onnx_kwargs=torch_onnx_kwargs)
 
 
 class Trainer(object):
@@ -95,6 +87,7 @@ class Trainer(object):
             transform_train = transforms.Compose(train_transforms_list)
             builder = CIFAR10
             self.num_classes = 10
+            self.in_channels = 3
         elif dataset == 'CIFAR100':
             train_transforms_list = [transforms.RandomCrop(32, padding=4),
                                      transforms.RandomHorizontalFlip(),
@@ -102,11 +95,13 @@ class Trainer(object):
             transform_train = transforms.Compose(train_transforms_list)
             builder = CIFAR100
             self.num_classes = 100
+            self.in_channels = 3
 
         elif dataset == 'MNIST':
             transform_train = transform_to_tensor
             builder = MNIST
             self.num_classes = 10
+            self.in_channels = 1
         else:
             raise Exception("Dataset not supported: {}".format(args.dataset))
 
@@ -238,6 +233,19 @@ class Trainer(object):
         if args.resume and not args.evaluate and self.scheduler is not None:
             self.scheduler.last_epoch = package['epoch'] - 1
 
+    def quant_export(self, model, output_dir_path, model_name,
+                     input_shape=(1, 3, 32, 32),
+                     input_tensor=None, torch_onnx_kwargs={}):
+        # move model to CPU otherwise the export fails
+        model.to("cpu")
+        bo.export_finn_onnx(module=model,
+                            input_shape=input_shape,
+                            export_path=output_dir_path + "/" + model_name + ".onnx",
+                            input_t=input_tensor,
+                            torch_onnx_kwargs=torch_onnx_kwargs)
+        # move back to intended device
+        model.to(device=self.device)
+
     def checkpoint_best(self, epoch, name):
         best_path = os.path.join(self.checkpoints_dir_path, name)
         self.logger.info("Saving checkpoint model to {}".format(best_path))
@@ -249,7 +257,7 @@ class Trainer(object):
         }, best_path)
 
         quant_export(self.model, self.checkpoints_dir_path, name,
-                     input_shape=(1, self.num_classes, 32, 32))
+                     input_shape=(1, self.in_channels, 32, 32))
 
     def train_model(self):
 
