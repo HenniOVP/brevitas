@@ -32,12 +32,17 @@ __all__ = ['cnv_1w1a', 'cnv_1w2a', 'cnv_2w2a',
            'lfc_1w1a', 'lfc_1w2a',
            'model_with_cfg']
 
-from .CNV import cnv
-from .FC import fc
+from .CNV import cnv, CNV
+from .FC import fc, FC
 
 model_impl = {
     'CNV': cnv,
     'FC': fc,
+}
+
+model_impl_no_wrapper = {
+    'CNV': CNV,
+    'FC': FC,
 }
 
 def get_model_cfg(name):

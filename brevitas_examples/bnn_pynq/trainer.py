@@ -34,7 +34,7 @@ from torchvision import transforms
 from torchvision.datasets import MNIST, CIFAR10, CIFAR100
 
 from .logger import Logger, TrainingEpochMeters, EvalEpochMeters
-from .models import model_with_cfg
+from .models import model_with_cfg, model_impl_no_wrapper
 from .models.losses import SqrHingeLoss
 
 from brevitas.onnx import FINNManager
