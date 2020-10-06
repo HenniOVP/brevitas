@@ -59,8 +59,6 @@ def accuracy(output, target, topk=(1,)):
 class Trainer(object):
     def __init__(self, args):
 
-        model, cfg = model_with_cfg(args.network, args.pretrained)
-
         # Init arguments
         self.args = args
         experiment_name = '{}_{}_{}'.format(args.dataset, args.network, datetime.now().strftime('%Y%m%d_%H%M%S'))
