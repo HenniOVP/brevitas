@@ -135,8 +135,9 @@ class Trainer(object):
                           in_bit_width=in_bit_width,
                           in_ch=self.in_channels,
                           )
-            msg = "Created fresh model for {}, with num_classes: {}, weight_bit_width: {}, act_bit_width: {}, in_bit_width: {}"
-            msg = msg.format(args.network, self.num_classes, args.weight_bit_width, args.act_bit_width, in_bit_width)
+            msg = "Created fresh model for {}, with num_classes: {}, weight_bit_width: {}, act_bit_width: {}"
+            msg += ", in_bit_width: {}, in_ch: {}"
+            msg = msg.format(args.network, self.num_classes, args.weight_bit_width, args.act_bit_width, in_bit_width, self.in_channels)
             self.logger.info(msg)
 
         # Randomness
@@ -234,14 +235,13 @@ class Trainer(object):
 
     def quant_export(self, model, output_dir_path, model_name,
                      input_shape=(1, 3, 32, 32),
-                     input_tensor=None, torch_onnx_kwargs={}):
+                     input_tensor=None):
         # move model to CPU otherwise the export fails
         model.to("cpu")
         FINNManager.export_onnx(module=model,
                             input_shape=input_shape,
                             export_path=output_dir_path + "/" + model_name + ".onnx",
-                            input_t=input_tensor,
-                            torch_onnx_kwargs=torch_onnx_kwargs)
+                            input_t=input_tensor)
         # move back to intended device
         model.to(device=self.device)
 
