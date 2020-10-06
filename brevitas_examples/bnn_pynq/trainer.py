@@ -133,6 +133,7 @@ class Trainer(object):
                           weight_bit_width=args.weight_bit_width,
                           act_bit_width=args.act_bit_width,
                           in_bit_width=in_bit_width,
+                          in_ch=self.in_channels,
                           )
             msg = "Created fresh model for {}, with num_classes: {}, weight_bit_width: {}, act_bit_width: {}, in_bit_width: {}"
             msg = msg.format(args.network, self.num_classes, args.weight_bit_width, args.act_bit_width, in_bit_width)
