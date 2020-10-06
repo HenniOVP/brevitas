@@ -31,11 +31,13 @@ from torch import nn
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.datasets import MNIST, CIFAR10
+from torchvision.datasets import MNIST, CIFAR10, CIFAR100
 
 from .logger import Logger, TrainingEpochMeters, EvalEpochMeters
 from .models import model_with_cfg
 from .models.losses import SqrHingeLoss
+
+from brevitas.onnx import FINNManager
 
 
 def accuracy(output, target, topk=(1,)):
@@ -61,8 +63,7 @@ class Trainer(object):
 
         # Init arguments
         self.args = args
-        prec_name = "_{}W{}A".format(cfg.getint('QUANT', 'WEIGHT_BIT_WIDTH'), cfg.getint('QUANT', 'ACT_BIT_WIDTH'))
-        experiment_name = '{}{}_{}'.format(args.network, prec_name, datetime.now().strftime('%Y%m%d_%H%M%S'))
+        experiment_name = '{}_{}_{}'.format(args.dataset, args.network, datetime.now().strftime('%Y%m%d_%H%M%S'))
         self.output_dir_path = os.path.join(args.experiments, experiment_name)
 
         if self.args.resume:
@@ -76,28 +77,75 @@ class Trainer(object):
                 os.mkdir(self.checkpoints_dir_path)
         self.logger = Logger(self.output_dir_path, args.dry_run)
 
-        # Randomness
-        random.seed(args.random_seed)
-        torch.manual_seed(args.random_seed)
-        torch.cuda.manual_seed_all(args.random_seed)
-
-        # Datasets
+        # Get requested dataset
         transform_to_tensor = transforms.Compose([transforms.ToTensor()])
-
-        dataset = cfg.get('MODEL', 'DATASET')
-        self.num_classes = cfg.getint('MODEL', 'NUM_CLASSES')
+        dataset = args.dataset
         if dataset == 'CIFAR10':
             train_transforms_list = [transforms.RandomCrop(32, padding=4),
                                      transforms.RandomHorizontalFlip(),
                                      transforms.ToTensor()]
             transform_train = transforms.Compose(train_transforms_list)
             builder = CIFAR10
+            self.num_classes = 10
+            self.in_channels = 3
+        elif dataset == 'CIFAR100':
+            train_transforms_list = [transforms.RandomCrop(32, padding=4),
+                                     transforms.RandomHorizontalFlip(),
+                                     transforms.ToTensor()]
+            transform_train = transforms.Compose(train_transforms_list)
+            builder = CIFAR100
+            self.num_classes = 100
+            self.in_channels = 3
 
         elif dataset == 'MNIST':
             transform_train = transform_to_tensor
             builder = MNIST
+            self.num_classes = 10
+            self.in_channels = 1
         else:
             raise Exception("Dataset not supported: {}".format(args.dataset))
+
+        # Try to extract the correct model from save data
+        try:
+            model, cfg = model_with_cfg(args.network, args.pretrained)
+            # Check that requested dataset matches and num classes
+            msg = "Loaded model miss match, call arguments requested {}, but saved is {}"
+            msg = msg.format(dataset, cfg.get('MODEL', 'DATASET'))
+            assert dataset == cfg.get('MODEL', 'DATASET'), msg
+            msg = "Loaded model num_classes miss match, call arguments requested {}, but saved is {}"
+            msg = msg.format(self.num_classes, cfg.getint('MODEL', 'NUM_CLASSES'))
+            assert self.num_classes == cfg.getint('MODEL', 'NUM_CLASSES'), msg
+            self.logger.info("Loaded {} from original examples".format(args.network))
+        except AssertionError as e:
+            # Create requested model ourselves
+            msg = "Could not load default model, creating new one as requested. The following assertion failed: {}"
+            msg = msg.format(e)
+            self.logger.warning(msg)
+            # Extract architecture info, example string: LFC_1W1A
+            arch = args.network.split("_")[0].upper()
+            if arch not in model_impl_no_wrapper:
+                raise Exception("Model not supported: {}".format(arch))
+            # Instaciate network
+            if arch == "CNV":
+                in_bit_width = 8
+            else:
+                in_bit_width = 1
+            model = model_impl_no_wrapper[arch]
+            model = model(num_classes=self.num_classes,
+                          weight_bit_width=args.weight_bit_width,
+                          act_bit_width=args.act_bit_width,
+                          in_bit_width=in_bit_width,
+                          )
+            msg = "Created fresh model for {}, with num_classes: {}, weight_bit_width: {}, act_bit_width: {}, in_bit_width: {}"
+            msg = msg.format(args.network, self.num_classes, args.weight_bit_width, args.act_bit_width, in_bit_width)
+            self.logger.info(msg)
+
+        # Randomness
+        random.seed(args.random_seed)
+        torch.manual_seed(args.random_seed)
+        torch.cuda.manual_seed_all(args.random_seed)
+
+        # Datasets building
 
         train_set = builder(root=args.datadir,
                             train=True,
@@ -185,6 +233,19 @@ class Trainer(object):
         if args.resume and not args.evaluate and self.scheduler is not None:
             self.scheduler.last_epoch = package['epoch'] - 1
 
+    def quant_export(self, model, output_dir_path, model_name,
+                     input_shape=(1, 3, 32, 32),
+                     input_tensor=None, torch_onnx_kwargs={}):
+        # move model to CPU otherwise the export fails
+        model.to("cpu")
+        FINNManager.export_onnx(module=model,
+                            input_shape=input_shape,
+                            export_path=output_dir_path + "/" + model_name + ".onnx",
+                            input_t=input_tensor,
+                            torch_onnx_kwargs=torch_onnx_kwargs)
+        # move back to intended device
+        model.to(device=self.device)
+
     def checkpoint_best(self, epoch, name):
         best_path = os.path.join(self.checkpoints_dir_path, name)
         self.logger.info("Saving checkpoint model to {}".format(best_path))
@@ -194,6 +255,8 @@ class Trainer(object):
             'epoch': epoch + 1,
             'best_val_acc': self.best_val_acc,
         }, best_path)
+        self.quant_export(self.model, self.checkpoints_dir_path, name,
+                          input_shape=(1, self.in_channels, 32, 32))
 
     def train_model(self):
 
